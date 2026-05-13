@@ -10,6 +10,14 @@ import { type InstanceContext } from "./instance-context"
 import { InstanceBootstrap } from "./bootstrap-service"
 import { InstanceBootstrap as InstanceBootstrapGraph } from "./bootstrap"
 import * as Project from "./project"
+import * as Log from "@opencode-ai/core/util/log"
+
+const log = Log.create({ service: "instance-store" })
+
+const MAX_INSTANCES = (() => {
+  const v = parseInt(process.env["OPENCODE_MAX_INSTANCES"] ?? "", 10)
+  return Number.isFinite(v) && v > 0 ? v : 5
+})()
 
 export interface LoadInput {
   directory: string
@@ -32,6 +40,7 @@ export const use = serviceUse(Service)
 
 interface Entry {
   readonly deferred: Deferred.Deferred<InstanceContext>
+  lastUsed: number
 }
 
 export const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Service> = Layer.effect(
@@ -105,14 +114,40 @@ export const layer: Layer.Layer<Service, never, Project.Service | InstanceBootst
       return true
     })
 
+    const evictLru = Effect.fnUntraced(function* () {
+      if (cache.size < MAX_INSTANCES) return
+      let lruDir: string | undefined
+      let lruTime = Infinity
+      for (const [dir, entry] of cache) {
+        if (entry.lastUsed < lruTime) {
+          lruTime = entry.lastUsed
+          lruDir = dir
+        }
+      }
+      if (!lruDir) return
+      const entry = cache.get(lruDir)!
+      const exit = yield* Deferred.await(entry.deferred).pipe(Effect.exit)
+      if (Exit.isSuccess(exit)) {
+        log.info("evicting lru instance", { directory: lruDir })
+        yield* disposeEntry(lruDir, entry, exit.value).pipe(Effect.ignore)
+      } else {
+        yield* removeEntry(lruDir, entry)
+      }
+    })
+
     const load = (input: LoadInput): Effect.Effect<InstanceContext> => {
       const directory = FSUtil.resolve(input.directory)
       return Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const existing = cache.get(directory)
-          if (existing) return yield* restore(Deferred.await(existing.deferred))
+          if (existing) {
+            existing.lastUsed = Date.now()
+            return yield* restore(Deferred.await(existing.deferred))
+          }
 
-          const entry: Entry = { deferred: Deferred.makeUnsafe<InstanceContext>() }
+          yield* evictLru()
+
+          const entry: Entry = { deferred: Deferred.makeUnsafe<InstanceContext>(), lastUsed: Date.now() }
           cache.set(directory, entry)
           yield* Effect.gen(function* () {
             yield* Effect.logInfo("creating instance", { directory: directory })
@@ -128,7 +163,7 @@ export const layer: Layer.Layer<Service, never, Project.Service | InstanceBootst
       return Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const previous = cache.get(directory)
-          const entry: Entry = { deferred: Deferred.makeUnsafe<InstanceContext>() }
+          const entry: Entry = { deferred: Deferred.makeUnsafe<InstanceContext>(), lastUsed: Date.now() }
           cache.set(directory, entry)
           yield* Effect.gen(function* () {
             yield* Effect.logInfo("reloading instance", { directory: directory })
